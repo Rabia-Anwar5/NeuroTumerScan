@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision
+monai>=1.3.0
+nibabel>=5.0.0
+SimpleITK
+numpy
+matplotlib
