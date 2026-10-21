@@ -1,6 +1,4 @@
 data/
-outputs/checkpoints/
+# outputs/checkpoints/
 *.nii.gz
-*.pth
 __pycache__/
-.ipynb_checkpoints/

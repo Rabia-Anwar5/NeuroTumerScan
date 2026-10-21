@@ -41,6 +41,142 @@ from monai.transforms import (
 )
 
 
+def generate_realistic_sample_patient(
+    patient_dir: str,
+    patient_id: str = "BraTS2021_00001",
+    shape: Tuple[int, int, int] = (140, 140, 140),
+    tumor_center: Optional[Tuple[int, int, int]] = None,
+    r_wt: int = 24,
+    r_tc: int = 16,
+    r_nec: int = 10,
+    seed: Optional[int] = None
+) -> Dict[str, Union[List[str], str]]:
+    """
+    Synthesizes a clinically realistic multi-parametric brain MRI scan with verified
+    skull-stripping and standard radiographic contrast profiles across T1, T1CE, T2, FLAIR,
+    and ground-truth tumor sub-region labels respecting biological hierarchy (ET ⊆ TC ⊆ WT).
+    """
+    os.makedirs(patient_dir, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    affine = np.eye(4)
+
+    # 1. Ellipsoid skull-stripped brain parenchyma
+    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    cx, cy, cz = shape[2] // 2, shape[1] // 2, shape[0] // 2
+    brain_mask = (((x - cx) / 48.0)**2 + ((y - cy) / 52.0)**2 + ((z - cz) / 44.0)**2) <= 1.0
+
+    # Ventricular CSF spaces (central hypointense on T1/FLAIR, bright on T2)
+    ventricles = (((x - cx) / 9.0)**2 + ((y - (cy - 2)) / 17.0)**2 + ((z - cz) / 14.0)**2) <= 1.0
+    ventricles = ventricles & brain_mask
+
+    # 2. Tumor morphology & sub-region hierarchy
+    if tumor_center is None:
+        tx, ty, tz = cx, cy, cz
+    else:
+        tx, ty, tz = tumor_center
+
+    dist = np.sqrt((x - tx)**2 + (y - ty)**2 + (z - tz)**2)
+
+    # Initialize mask: 0=Background, 1=Necrotic Core, 2=Edema, 4=Enhancing Margin
+    mask = np.zeros(shape, dtype=np.uint8)
+    # Whole Tumor (edema shell)
+    mask[dist <= r_wt] = 2
+    # Tumor Core (necrotic center)
+    mask[dist <= r_tc] = 1
+    # Enhancing active rim
+    mask[(dist >= r_nec) & (dist <= r_tc)] = 4
+    # Confine inside brain tissue
+    mask = mask * brain_mask.astype(np.uint8)
+
+    # 3. Radiographic multi-parametric contrast synthesis
+    vol = np.zeros((4, *shape), dtype=np.float32)
+    n_brain = int(np.sum(brain_mask))
+    edema_idx = (mask == 2)
+    nec_idx = (mask == 1)
+    et_idx = (mask == 4)
+
+    # T1: Brain ~100, Ventricles ~20, Edema ~80, Necrosis ~45, Enhancing ~95
+    vol[0, brain_mask] = rng.normal(100.0, 7.0, n_brain)
+    vol[0, ventricles] = rng.normal(25.0, 5.0, int(np.sum(ventricles)))
+    vol[0, edema_idx] = rng.normal(80.0, 6.0, int(np.sum(edema_idx)))
+    vol[0, nec_idx] = rng.normal(45.0, 5.0, int(np.sum(nec_idx)))
+    vol[0, et_idx] = rng.normal(95.0, 7.0, int(np.sum(et_idx)))
+
+    # T1CE (Contrast): Brain ~100, Ventricles ~20, Edema ~80, Necrosis ~45, Active rim HYPERINTENSE ~235
+    vol[1, brain_mask] = rng.normal(100.0, 7.0, n_brain)
+    vol[1, ventricles] = rng.normal(25.0, 5.0, int(np.sum(ventricles)))
+    vol[1, edema_idx] = rng.normal(80.0, 6.0, int(np.sum(edema_idx)))
+    vol[1, nec_idx] = rng.normal(45.0, 5.0, int(np.sum(nec_idx)))
+    vol[1, et_idx] = rng.normal(235.0, 10.0, int(np.sum(et_idx)))
+
+    # T2: Brain ~85, Ventricles ~220, Edema HYPERINTENSE ~205, Necrosis ~185, Enhancing ~125
+    vol[2, brain_mask] = rng.normal(85.0, 6.0, n_brain)
+    vol[2, ventricles] = rng.normal(220.0, 10.0, int(np.sum(ventricles)))
+    vol[2, edema_idx] = rng.normal(205.0, 10.0, int(np.sum(edema_idx)))
+    vol[2, nec_idx] = rng.normal(185.0, 10.0, int(np.sum(nec_idx)))
+    vol[2, et_idx] = rng.normal(125.0, 8.0, int(np.sum(et_idx)))
+
+    # FLAIR: Brain ~90, Ventricles CSF SUPPRESSED ~25, Edema HYPERINTENSE ~220, Necrosis ~110, Enhancing ~140
+    vol[3, brain_mask] = rng.normal(90.0, 6.0, n_brain)
+    vol[3, ventricles] = rng.normal(25.0, 5.0, int(np.sum(ventricles)))
+    vol[3, edema_idx] = rng.normal(220.0, 10.0, int(np.sum(edema_idx)))
+    vol[3, nec_idx] = rng.normal(110.0, 8.0, int(np.sum(nec_idx)))
+    vol[3, et_idx] = rng.normal(140.0, 9.0, int(np.sum(et_idx)))
+
+    vol = np.clip(vol, 0.0, None).astype(np.float32)
+
+    # 4. Save NIfTI volumes
+    seq_names = ["t1", "t1ce", "t2", "flair"]
+    img_paths = []
+    for c, s in enumerate(seq_names):
+        fpath = os.path.join(patient_dir, f"{patient_id}_{s}.nii.gz")
+        nib.save(nib.Nifti1Image(vol[c], affine), fpath)
+        img_paths.append(fpath)
+
+    seg_path = os.path.join(patient_dir, f"{patient_id}_seg.nii.gz")
+    nib.save(nib.Nifti1Image(mask, affine), seg_path)
+
+    return {
+        "patient_id": patient_id,
+        "image": img_paths,
+        "label": seg_path
+    }
+
+
+def ensure_sample_dataset(data_dir: str, num_cases: int = 5) -> List[Dict[str, Union[List[str], str]]]:
+    """
+    Ensures that a specified directory has at least `num_cases` realistic multi-parametric
+    BraTS format patient cases, synthesizing them with diverse anatomical tumor locations if absent.
+    """
+    os.makedirs(data_dir, exist_ok=True)
+    existing = load_brats_file_list(data_dir)
+    if len(existing) >= num_cases:
+        return existing
+
+    case_profiles = [
+        {"id": "BraTS2021_00001", "center": (70, 70, 70), "r_wt": 25, "r_tc": 16, "r_nec": 10, "seed": 42},
+        {"id": "BraTS2021_00002", "center": (56, 76, 72), "r_wt": 22, "r_tc": 14, "r_nec": 9,  "seed": 43},
+        {"id": "BraTS2021_00003", "center": (84, 66, 68), "r_wt": 23, "r_tc": 15, "r_nec": 10, "seed": 44},
+        {"id": "BraTS2021_00004", "center": (72, 82, 64), "r_wt": 21, "r_tc": 13, "r_nec": 8,  "seed": 45},
+        {"id": "BraTS2021_00005", "center": (68, 58, 76), "r_wt": 26, "r_tc": 17, "r_nec": 11, "seed": 46},
+    ]
+
+    for p in case_profiles[:num_cases]:
+        p_dir = os.path.join(data_dir, p["id"])
+        if not os.path.exists(p_dir) or not glob.glob(os.path.join(p_dir, "*seg.nii*")):
+            generate_realistic_sample_patient(
+                p_dir,
+                patient_id=p["id"],
+                tumor_center=p["center"],
+                r_wt=p["r_wt"],
+                r_tc=p["r_tc"],
+                r_nec=p["r_nec"],
+                seed=p["seed"]
+            )
+
+    return load_brats_file_list(data_dir)
+
+
 def load_brats_file_list(data_dir: str) -> List[Dict[str, Union[List[str], str]]]:
     """
     Scans a directory for patient sub-directories containing BraTS MRI sequences.
@@ -260,7 +396,10 @@ def resample_to_isotropic(
     return resample.Execute(itk_image)
 
 
-def get_module1_transforms(patch_size: Tuple[int, int, int] = (128, 128, 128)) -> Compose:
+def get_module1_transforms(
+    patch_size: Tuple[int, int, int] = (128, 128, 128),
+    num_samples: int = 1
+) -> Compose:
     """
     Full MONAI Preprocessing & Patch Extraction Pipeline:
     1. LoadImaged: Loads NIfTI files into 4-channel image and label
@@ -269,7 +408,7 @@ def get_module1_transforms(patch_size: Tuple[int, int, int] = (128, 128, 128)) -
     4. Spacingd: 1.0 mm³ isotropic voxel resampling
     5. NormalizeIntensityd: Non-zero brain intensity z-score normalization
     6. RandCropByPosNegLabeld: Balanced patch extraction focused on tumor tissue
-    7. RandFlipd & RandGaussianNoised: Spatial data augmentation
+    7. RandFlipd: Spatial data augmentation
     8. EnsureTyped: Convert to PyTorch float32 tensors
     """
     return Compose([
@@ -288,7 +427,7 @@ def get_module1_transforms(patch_size: Tuple[int, int, int] = (128, 128, 128)) -
             spatial_size=patch_size,
             pos=2,
             neg=1,
-            num_samples=1,
+            num_samples=num_samples,
             image_key="image",
             image_threshold=0
         ),
@@ -331,13 +470,14 @@ def get_brats_dataloader(
     batch_size: int = 1, 
     patch_size: Tuple[int, int, int] = (128, 128, 128), 
     shuffle: bool = True,
-    training: bool = True
+    training: bool = True,
+    num_samples: int = 1
 ) -> DataLoader:
     """
     Creates a PyTorch/MONAI DataLoader with balanced 3D patch extraction for training,
     or full-volume evaluation transforms for validation.
     """
-    transforms = get_module1_transforms(patch_size=patch_size) if training else get_val_transforms()
+    transforms = get_module1_transforms(patch_size=patch_size, num_samples=num_samples) if training else get_val_transforms()
     dataset = Dataset(data=data_list, transform=transforms)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 

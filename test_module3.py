@@ -103,10 +103,14 @@ def test_module3():
     # 5. Checkpoint Management
     checkpoints_dir = os.path.join(PROJECT_ROOT, "outputs", "checkpoints")
     os.makedirs(checkpoints_dir, exist_ok=True)
-    ckpt_path = os.path.join(checkpoints_dir, "best_segresnet_metric.pth")
-    torch.save(model.state_dict(), ckpt_path)
-    assert os.path.exists(ckpt_path), "Checkpoint failed to save"
-    print(f" [5/6] Checkpoint successfully persisted to: {ckpt_path}")
+    test_ckpt_path = os.path.join(checkpoints_dir, "test_segresnet_metric.pth")
+    torch.save(model.state_dict(), test_ckpt_path)
+    assert os.path.exists(test_ckpt_path), "Checkpoint failed to save"
+
+    main_ckpt_path = os.path.join(checkpoints_dir, "best_segresnet_metric.pth")
+    if not os.path.exists(main_ckpt_path):
+        torch.save(model.state_dict(), main_ckpt_path)
+    print(f" [5/6] Verification checkpoint successfully persisted to: {test_ckpt_path}")
 
     # 6. Save Verification Visual Plot
     outputs_dir = os.path.join(PROJECT_ROOT, "outputs")

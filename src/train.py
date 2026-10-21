@@ -32,20 +32,20 @@ from monai.transforms import Activations, AsDiscrete, Compose
 
 try:
     from src.model import get_segresnet_model, get_loss_function, convert_labels_to_brats_classes
-    from src.dataset_pipeline import load_brats_file_list, get_brats_dataloader
+    from src.dataset_pipeline import load_brats_file_list, get_brats_dataloader, ensure_sample_dataset
     from src.inference import compute_clinical_validation_metrics
 except ModuleNotFoundError:
     from model import get_segresnet_model, get_loss_function, convert_labels_to_brats_classes
-    from dataset_pipeline import load_brats_file_list, get_brats_dataloader
+    from dataset_pipeline import load_brats_file_list, get_brats_dataloader, ensure_sample_dataset
     from inference import compute_clinical_validation_metrics
 
 
 def train_and_validate(
     data_dir: str,
-    num_epochs: int = 3,
+    num_epochs: int = 35,
     batch_size: int = 1,
     patch_size: tuple = (128, 128, 128),
-    lr: float = 1e-4,
+    lr: float = 2e-4,
     checkpoint_dir: str = "./outputs/checkpoints"
 ) -> Dict[str, Any]:
     """
@@ -69,6 +69,10 @@ def train_and_validate(
     # 1. Dataset & Dataloaders
     file_list = load_brats_file_list(data_dir)
     if len(file_list) == 0:
+        print(f"Notice: No data in {data_dir}. Initializing standardized BraTS sample dataset...")
+        file_list = ensure_sample_dataset(data_dir, num_cases=5)
+
+    if len(file_list) == 0:
         raise ValueError(f"No valid BraTS patient data detected in {data_dir}")
 
     print(f"Loaded {len(file_list)} patient case(s) for training and validation.")
@@ -87,14 +91,19 @@ def train_and_validate(
               "These scores are NOT a held-out evaluation.")
         train_files = val_files = file_list
     print(f"Train cases: {len(train_files)} | Validation cases: {len(val_files)} | held-out: {held_out}")
-    train_loader = get_brats_dataloader(train_files, batch_size=batch_size, patch_size=patch_size, shuffle=True)
-    val_loader = get_brats_dataloader(val_files, batch_size=1, patch_size=patch_size, shuffle=False, training=False)
+    train_loader = get_brats_dataloader(
+        train_files, batch_size=batch_size, patch_size=patch_size, shuffle=True, training=True, num_samples=2
+    )
+    val_loader = get_brats_dataloader(
+        val_files, batch_size=1, patch_size=patch_size, shuffle=False, training=False
+    )
 
-    # 2. Model, Loss, Optimizer, Scheduler
+    # 2. Model, Loss, Optimizer, Scheduler, AMP Scaler
     model = get_segresnet_model(in_channels=4, out_channels=3, init_filters=16).to(device)
     loss_fn = get_loss_function(subregion_weights=(1.0, 1.2, 1.5))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     # 3. Post-processing transforms and validation metric calculators
     post_trans = Compose([
@@ -124,13 +133,21 @@ def train_and_validate(
             targets = convert_labels_to_brats_classes(labels)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = loss_fn(outputs, targets)
-            loss.backward()
-            
-            # Gradient clipping for training stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(inputs)
+                    loss = loss_fn(outputs, targets)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = loss_fn(outputs, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
             epoch_loss += loss.item()
 
@@ -150,17 +167,31 @@ def train_and_validate(
                 val_labels = val_data["label"].to(device)
                 val_targets = convert_labels_to_brats_classes(val_labels)
 
-                # Sliding window inference with Gaussian blending
-                val_outputs = sliding_window_inference(
-                    inputs=val_inputs,
-                    roi_size=patch_size,
-                    sw_batch_size=1,
-                    predictor=model,
-                    overlap=0.25,
-                    mode="gaussian"
-                )
+                # Pad if volume dimension is smaller than patch size
+                orig_shape = val_inputs.shape[2:]
+                pad_h = max(0, patch_size[0] - val_inputs.shape[2])
+                pad_w = max(0, patch_size[1] - val_inputs.shape[3])
+                pad_d = max(0, patch_size[2] - val_inputs.shape[4])
+                if pad_h > 0 or pad_w > 0 or pad_d > 0:
+                    val_inputs_pad = torch.nn.functional.pad(
+                        val_inputs, (0, pad_d, 0, pad_w, 0, pad_h), mode="constant", value=0
+                    )
+                else:
+                    val_inputs_pad = val_inputs
 
-                val_outputs_bin = post_trans(val_outputs)
+                # Sliding window inference with Gaussian blending under AMP
+                with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                    val_outputs = sliding_window_inference(
+                        inputs=val_inputs_pad,
+                        roi_size=patch_size,
+                        sw_batch_size=1,
+                        predictor=model,
+                        overlap=0.25,
+                        mode="gaussian"
+                    )
+                val_outputs = val_outputs[:, :, :orig_shape[0], :orig_shape[1], :orig_shape[2]]
+
+                val_outputs_bin = post_trans(val_outputs.float())
                 dice_metric(y_pred=val_outputs_bin, y=val_targets)
                 try:
                     hd95_metric(y_pred=val_outputs_bin, y=val_targets)
@@ -175,7 +206,6 @@ def train_and_validate(
             mean_dice = (wt_dice + tc_dice + et_dice) / 3.0
 
             # HD95 is None when it could not be computed (e.g. an empty sub-region).
-            # Never substitute a made-up number: report it as unavailable.
             def _hd(scores, i):
                 try:
                     v = float(scores[i].item())
@@ -230,4 +260,4 @@ if __name__ == "__main__":
     DATA_PATH = "./data/BraTS2021_Training_Data"
     if not os.path.exists(DATA_PATH) or not any(os.scandir(DATA_PATH)):
         DATA_PATH = "./data/BraTS2021_Sample"
-    train_and_validate(DATA_PATH, num_epochs=3, batch_size=1, patch_size=(128, 128, 128))
+    train_and_validate(DATA_PATH, num_epochs=35, batch_size=1, patch_size=(128, 128, 128))

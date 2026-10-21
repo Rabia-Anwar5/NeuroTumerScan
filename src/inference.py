@@ -59,7 +59,8 @@ class BrainTumorInferenceEngine:
         self,
         volume_tensor_or_array: Union[torch.Tensor, np.ndarray],
         overlap: float = 0.25,
-        sw_batch_size: int = 1
+        sw_batch_size: int = 1,
+        apply_postprocessing: bool = False
     ) -> Dict[str, np.ndarray]:
         """
         Runs sliding-window inference with Gaussian blending across full 3D volume.
@@ -68,6 +69,8 @@ class BrainTumorInferenceEngine:
             volume_tensor_or_array: Array or Tensor of shape (4, H, W, D) or (1, 4, H, W, D)
             overlap: Overlap fraction between adjacent patches (0.25 - 0.5)
             sw_batch_size: Batch size of patches processed per forward pass
+            apply_postprocessing: If True, applies 3D connected-component noise island filtering
+                                  and biological hierarchy enforcement (ET ⊆ TC ⊆ WT).
         Returns:
             Dictionary with:
             - 'probabilities': (3, H, W, D) float32 in [0, 1]
@@ -84,6 +87,15 @@ class BrainTumorInferenceEngine:
 
         vol = vol.to(self.device)
 
+        # Ensure input is z-score normalized on non-zero brain voxels per sequence
+        # (3D SegResNet was trained on normalized inputs via NormalizeIntensityd)
+        for c in range(vol.shape[1]):
+            m = vol[0, c] > 1e-4
+            if m.any() and (torch.abs(vol[0, c][m].mean()) > 3.0 or vol[0, c][m].std() > 5.0):
+                c_mean = vol[0, c][m].mean()
+                c_std = vol[0, c][m].std()
+                vol[0, c][m] = (vol[0, c][m] - c_mean) / (c_std + 1e-8)
+
         # Pad if volume dimension is smaller than patch size
         pad_h = max(0, self.patch_size[0] - vol.shape[2])
         pad_w = max(0, self.patch_size[1] - vol.shape[3])
@@ -93,15 +105,16 @@ class BrainTumorInferenceEngine:
             vol = torch.nn.functional.pad(vol, (0, pad_d, 0, pad_w, 0, pad_h), mode="constant", value=0)
 
         with torch.no_grad():
-            logits = sliding_window_inference(
-                inputs=vol,
-                roi_size=self.patch_size,
-                sw_batch_size=sw_batch_size,
-                predictor=self.model,
-                overlap=overlap,
-                mode="gaussian"
-            )
-            probs = self.post_sigmoid(logits)
+            with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
+                logits = sliding_window_inference(
+                    inputs=vol,
+                    roi_size=self.patch_size,
+                    sw_batch_size=sw_batch_size,
+                    predictor=self.model,
+                    overlap=overlap,
+                    mode="gaussian"
+                )
+            probs = self.post_sigmoid(logits.float())
             binary = (probs > 0.5).to(torch.uint8)
 
         # Unpad if padded
@@ -109,6 +122,18 @@ class BrainTumorInferenceEngine:
         probs_np = probs[0, :, :h, :w, :d].cpu().numpy()
         binary_np = binary[0, :, :h, :w, :d].cpu().numpy()
         
+        # Optional clinical morphological post-processing
+        if apply_postprocessing:
+            try:
+                from src.volumetrics import remove_spurious_islands, enforce_hierarchical_consistency
+            except ModuleNotFoundError:
+                from volumetrics import remove_spurious_islands, enforce_hierarchical_consistency
+            wt_c = remove_spurious_islands(binary_np[0], min_size_voxels=50)
+            tc_c = remove_spurious_islands(binary_np[1], min_size_voxels=30)
+            et_c = remove_spurious_islands(binary_np[2], min_size_voxels=10)
+            wt_c, tc_c, et_c = enforce_hierarchical_consistency(wt_c, tc_c, et_c)
+            binary_np = np.stack([wt_c, tc_c, et_c], axis=0)
+
         # Convert to standard BraTS 0, 1, 2, 4 label mask
         reconstructed_seg = convert_brats_classes_to_labels(binary_np)
 

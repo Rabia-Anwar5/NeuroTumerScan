@@ -24,7 +24,8 @@ from src.dataset_pipeline import (
     validate_skull_stripping,
     verify_and_align_multimodal_sequences,
     get_module1_transforms,
-    get_brats_dataloader
+    get_brats_dataloader,
+    generate_realistic_sample_patient
 )
 # pyrefly: ignore[missing-import]
 from monai.data import Dataset, DataLoader
@@ -37,31 +38,19 @@ def test_module1():
 
     test_dir = os.path.join(PROJECT_ROOT, "data", "BraTS2021_Sample", "BraTS2021_00001")
     os.makedirs(test_dir, exist_ok=True)
-    affine = np.eye(4)
-    shape = (140, 140, 140)
 
-    # 1. Synthesize realistic skull-stripped multimodal scan
-    z, y, x = np.ogrid[:140, :140, :140]
-    brain_mask = (((x - 70) / 48)**2 + ((y - 70) / 52)**2 + ((z - 70) / 44)**2) <= 1.0
-
-    seq_paths = []
-    for seq in ["t1", "t1ce", "t2", "flair"]:
-        fpath = os.path.join(test_dir, f"BraTS2021_00001_{seq}.nii.gz")
-        seq_paths.append(fpath)
-        
-        vol = np.zeros(shape, dtype=np.float32)
-        noise = (np.random.randn(int(np.sum(brain_mask))) * 18 + 100).astype(np.float32)
-        noise[noise < 0] = 0
-        vol[brain_mask] = noise
-        nib.save(nib.Nifti1Image(vol, affine), fpath)
-
-    seg_path = os.path.join(test_dir, "BraTS2021_00001_seg.nii.gz")
-    mask = np.zeros(shape, dtype=np.uint8)
-    mask[55:85, 55:85, 55:85] = 1   # Necrotic core
-    mask[45:95, 45:95, 45:95] = 2   # Edema
-    mask[65:80, 65:80, 65:80] = 4   # Enhancing margin
-    mask = mask * brain_mask.astype(np.uint8)  # Confine inside brain
-    nib.save(nib.Nifti1Image(mask, affine), seg_path)
+    # 1. Synthesize realistic skull-stripped multimodal scan with valid radiographic contrast
+    case_dict = generate_realistic_sample_patient(
+        test_dir,
+        patient_id="BraTS2021_00001",
+        tumor_center=(70, 70, 70),
+        r_wt=25,
+        r_tc=16,
+        r_nec=10,
+        seed=42
+    )
+    seq_paths = case_dict["image"]
+    seg_path = case_dict["label"]
 
     print(" [1/5] Skull-stripped multimodal scan files prepared.")
 

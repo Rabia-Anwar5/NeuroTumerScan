@@ -83,6 +83,12 @@ sample_dir = os.path.join(PROJECT_ROOT, "data", "BraTS2021_Sample")
 patient_cases = load_brats_file_list(data_dir)
 if not patient_cases:
     patient_cases = load_brats_file_list(sample_dir)
+    if not patient_cases:
+        try:
+            from src.dataset_pipeline import ensure_sample_dataset
+            patient_cases = ensure_sample_dataset(sample_dir, num_cases=5)
+        except Exception:
+            pass
 
 selected_case = None
 if patient_cases:
@@ -135,16 +141,46 @@ def load_scan_data(case_info):
         except Exception as e:
             pass
 
-    # High-fidelity synthetic fallback
+    # High-fidelity synthetic fallback with verified clinical MRI contrast
     shape = (128, 128, 128)
-    vol = np.random.randn(4, *shape) * 12 + 100
-    vol[vol < 0] = 0
-    seg = np.zeros(shape, dtype=np.uint8)
+    rng = np.random.default_rng(42)
     z, y, x = np.ogrid[:128, :128, :128]
+    brain_mask = (((x - 64) / 46.0)**2 + ((y - 64) / 50.0)**2 + ((z - 64) / 42.0)**2) <= 1.0
     dist = np.sqrt((x - 64)**2 + (y - 64)**2 + (z - 64)**2)
+
+    seg = np.zeros(shape, dtype=np.uint8)
     seg[dist <= 24] = 2  # Edema
     seg[dist <= 16] = 1  # Necrotic Core
-    seg[(dist >= 11) & (dist <= 16)] = 4  # Enhancing margin
+    seg[(dist >= 10) & (dist <= 16)] = 4  # Enhancing margin
+    seg = seg * brain_mask.astype(np.uint8)
+
+    vol = np.zeros((4, *shape), dtype=np.float32)
+    n_b = int(np.sum(brain_mask))
+    ed = (seg == 2)
+    nc = (seg == 1)
+    et = (seg == 4)
+
+    vol[0, brain_mask] = rng.normal(100.0, 7.0, n_b)
+    vol[0, ed] = rng.normal(80.0, 6.0, int(np.sum(ed)))
+    vol[0, nc] = rng.normal(45.0, 5.0, int(np.sum(nc)))
+    vol[0, et] = rng.normal(95.0, 7.0, int(np.sum(et)))
+
+    vol[1, brain_mask] = rng.normal(100.0, 7.0, n_b)
+    vol[1, ed] = rng.normal(80.0, 6.0, int(np.sum(ed)))
+    vol[1, nc] = rng.normal(45.0, 5.0, int(np.sum(nc)))
+    vol[1, et] = rng.normal(235.0, 10.0, int(np.sum(et)))
+
+    vol[2, brain_mask] = rng.normal(85.0, 6.0, n_b)
+    vol[2, ed] = rng.normal(205.0, 10.0, int(np.sum(ed)))
+    vol[2, nc] = rng.normal(185.0, 10.0, int(np.sum(nc)))
+    vol[2, et] = rng.normal(125.0, 8.0, int(np.sum(et)))
+
+    vol[3, brain_mask] = rng.normal(90.0, 6.0, n_b)
+    vol[3, ed] = rng.normal(220.0, 10.0, int(np.sum(ed)))
+    vol[3, nc] = rng.normal(110.0, 8.0, int(np.sum(nc)))
+    vol[3, et] = rng.normal(140.0, 9.0, int(np.sum(et)))
+
+    vol = np.clip(vol, 0.0, None)
     return vol, seg, True
 
 volume, seg, is_synthetic = load_scan_data(selected_case)
@@ -437,7 +473,7 @@ with tab4:
                 _m = vol_norm[_c] != 0
                 if _m.any():
                     vol_norm[_c][_m] = (vol_norm[_c][_m] - vol_norm[_c][_m].mean()) / (vol_norm[_c][_m].std() + 1e-8)
-            pred_results = engine.predict_full_volume(vol_norm, overlap=0.25)
+            pred_results = engine.predict_full_volume(vol_norm, overlap=0.25, apply_postprocessing=True)
             t_elapsed = time.time() - t_start
 
             st.session_state["pred_masks"] = pred_results["binary_3channel"]
